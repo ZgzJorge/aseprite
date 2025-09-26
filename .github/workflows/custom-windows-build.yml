@@ -1,0 +1,141 @@
+# Para las librerías faltantes descargar de
+# https://www.firedaemon.com/download-firedaemon-openssl
+# la última versión zip disponible
+# FireDaemon OpenSSL X.X.X Beta 1 ZIP x86+x64+ARM64 September 2025
+
+
+
+name: custom-windows-build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [RelWithDebInfo, Debug]
+        ui: [gui, cli]            # gui => Skia, cli => sin UI
+        scripting: [lua, noscripts]
+        exclude:
+          - build_type: Debug
+            ui: gui
+          - build_type: RelWithDebInfo
+            ui: cli
+          - build_type: RelWithDebInfo
+            scripting: noscripts
+
+    steps:
+      - name: Checkout (con submódulos)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Habilitar rutas largas de Git
+        shell: bash
+        run: git config --system core.longpaths true
+
+      - name: Configurar MSVC (VS 2022)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Instalar Ninja
+        uses: aseprite/get-ninja@main
+
+      # --- SKIA (solo para builds GUI) ---------------------------------------
+      - name: Resolver URL de Skia (solo GUI)
+        if: ${{ matrix.ui == 'gui' }}
+        id: skia
+        shell: bash
+        run: |
+          this_dir=$(cygpath "${{ github.workspace }}")
+          url=$(source "$this_dir/laf/misc/skia-url.sh" | xargs)
+          file=$(basename "$url")
+          echo "url=$url"   >> "$GITHUB_OUTPUT"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "arch=x64"   >> "$GITHUB_OUTPUT"
+
+      - name: Restaurar caché de Skia
+        if: ${{ matrix.ui == 'gui' }}
+        id: cache-skia
+        uses: actions/cache@v4
+        with:
+          path: skia
+          key: skia-${{ steps.skia.outputs.file }}
+
+      - name: Descargar y extraer Skia (si no hay caché)
+        if: ${{ matrix.ui == 'gui' && steps.cache-skia.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          mkdir -p skia
+          curl --ssl-revoke-best-effort -L -o "${{ steps.skia.outputs.file }}" "${{ steps.skia.outputs.url }}"
+          7z x "${{ steps.skia.outputs.file }}" -oskia
+      # -----------------------------------------------------------------------
+
+      - name: Generar Makefiles (CMake)
+        shell: bash
+        run: |
+          # En Windows no usamos ccache
+          export enable_ccache=off
+
+          # Backend de LAF según UI
+          if [[ "${{ matrix.ui }}" == "gui" ]]; then
+            export laf_backend=skia
+          else
+            export laf_backend=none
+          fi
+
+          # Scripting opcional
+          if [[ "${{ matrix.scripting }}" == "lua" ]]; then
+            export enable_scripting=on
+          else
+            export enable_scripting=off
+          fi
+
+          # Argumentos base
+          cmake_args=(
+            -S . -B build -G Ninja
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+            -DENABLE_TESTS=OFF
+            -DENABLE_SCRIPTING=$enable_scripting
+            -DENABLE_CCACHE=$enable_ccache
+            -DLAF_BACKEND=$laf_backend
+          )
+
+          # Añadir rutas de Skia solo para GUI
+          if [[ "$laf_backend" == "skia" ]]; then
+            cmake_args+=(
+              -DSKIA_DIR="$PWD/skia"
+              -DSKIA_LIBRARY_DIR="$PWD/skia/out/Release-x64"
+            )
+          fi
+
+          cmake "${cmake_args[@]}"
+
+      - name: Compilar (Ninja)
+        shell: bash
+        run: cmake --build build --config ${{ matrix.build_type }} --verbose
+
+      # --- Artefacto único con todo (decides en local) -----------------------
+      - name: Subir artefacto (todo para decidir en local)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-everything-${{ matrix.ui }}-${{ matrix.scripting }}-${{ matrix.build_type }}-windows
+          path: |
+            build/**
+            data/**
+            CMakeCache.txt
+            README*
+            LICENSE*
+          retention-days: 7
